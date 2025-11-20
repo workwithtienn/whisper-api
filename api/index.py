@@ -4,89 +4,110 @@ from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 import tempfile
 import os
+import json
 
-app = FastAPI(title="Whisper Tiny API - Free Vercel")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(
+    title="Whisper Transcription API",
+    description="Chuyển audio thành text với Faster-Whisper",
+    version="1.0"
+)
 
-# Load model một lần duy nhất + dùng tiny để siêu nhẹ
-model = WhisperModel("tiny", device="cpu", compute_type="int8")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+model = None
+
+def get_model():
+    global model
+    if model is None:
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+    return model
 
 @app.get("/")
-def home():
-    return {"status": "ok", "model": "tiny.int8", "tip": "Dùng POST /transcribe để upload file"}
+def root():
+    return {
+        "status": "ok",
+        "message": "Whisper Transcription API",
+        "endpoints": {
+            "/transcribe": "POST - Upload audio file",
+            "/transcribe/url": "GET - Transcribe from URL"
+        }
+    }
 
 @app.post("/transcribe")
-async def transcribe(
+async def transcribe_audio(
     file: UploadFile = File(...),
-    language: str = Query("vi", description="vi, en, ja, zh..."),
-    format: str = Query("json", description="json / text / srt")
+    language: str = Query("vi", description="Mã ngôn ngữ (vi, en, etc)"),
+    format: str = Query("json", description="Output format: json, text, srt")
 ):
-    # Chỉ cho phép file nhỏ để tránh timeout (free chỉ 60s)
-    if not file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac', '.webm')):
-        raise HTTPException(400, "Chỉ hỗ trợ mp3, wav, m4a, ogg, flac, webm")
+    if not file.filename.endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac')):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file audio: mp3, wav, m4a, ogg, flac")
 
-    # Giới hạn kích thước file ~25MB (khoảng 20-25 phút audio là max an toàn cho free)
-    content = await file.read()
-    if len(content) > 25 * 1024 * 1024:
-        raise HTTPException(400, "File quá lớn! Maximum 25MB (khoảng 20 phút audio)")
-
-    # Lưu tạm
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
-    temp_file.write(content)
-    temp_file.close()
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f"whisper_{file.filename}")
 
     try:
-        segments, info = model.transcribe(
-            temp_file.name,
-            language=language if language != "auto" else None,
-            beam_size=5,
-            word_timestamps=False  # tắt để nhanh hơn
+        with open(temp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        whisper_model = get_model()
+        segments, info = whisper_model.transcribe(
+            temp_path,
+            language=language,
+            beam_size=5
         )
 
-        result_segments = []
+        results = []
         full_text = []
 
-        for seg in segments:
-            result_segments.append({
-                "start": round(seg.start, 2),
-                "end": round(seg.end, 2),
-                "text": seg.text.strip()
+        for segment in segments:
+            results.append({
+                "start": round(segment.start, 2),
+                "end": round(segment.end, 2),
+                "text": segment.text.strip()
             })
-            full_text.append(seg.text.strip())
+            full_text.append(segment.text.strip())
 
-        os.unlink(temp_file.name)
+        os.remove(temp_path)
 
         if format == "text":
             return PlainTextResponse(" ".join(full_text))
+
         elif format == "srt":
-            srt = ""
-            for i, s in enumerate(result_segments, 1):
-                start = format_time(s["start"])
-                end = format_time(s["end"])
-                srt += f"{i}\n{start} --> {end}\n{s['text']}\n\n"
-            return PlainTextResponse(srt, media_type="text/plain")
+            srt_content = []
+            for i, seg in enumerate(results, 1):
+                start_time = format_timestamp(seg["start"])
+                end_time = format_timestamp(seg["end"])
+                srt_content.append(f"{i}\n{start_time} --> {end_time}\n{seg['text']}\n")
+            return PlainTextResponse("\n".join(srt_content))
+
         else:
             return JSONResponse({
                 "success": True,
                 "language": info.language,
-                "language_prob": round(info.language_probability, 2),
                 "duration": round(info.duration, 2),
-                "segments": result_segments,
-                "text": " ".join(full_text)
+                "segments": results,
+                "full_text": " ".join(full_text)
             })
 
     except Exception as e:
-        if os.path.exists(temp_file.name):
-            os.unlink(temp_file.name)
-        raise HTTPException(500, f"Lỗi xử lý: {str(e)}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(status_code=500, detail=str(e))
 
-def format_time(seconds: float):
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+def format_timestamp(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "model": "tiny.int8"}
+    return {"status": "healthy"}
