@@ -1,24 +1,15 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python"
-    }
-  ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/index.py"
+      "dest": "/api/index.py"
     }
   ],
   "functions": {
     "api/index.py": {
-      "maxDuration": 60,
-      "memory": 1024
+      "maxDuration": 300,
+      "memory": 3008
     }
-  },
-  "env": {
-    "PYTHONUNBUFFERED": "1"
   }
 }
