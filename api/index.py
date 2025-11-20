@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from mangum import Mangum
+from faster_whisper import WhisperModel
 import tempfile
 import os
 
@@ -19,20 +19,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global model variable
 model = None
 
 def get_model():
-    """Lazy load model để tiết kiệm memory"""
     global model
     if model is None:
-        try:
-            from faster_whisper import WhisperModel
-            # Sử dụng model nhỏ nhất để fit vào Vercel limits
-            model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            raise HTTPException(status_code=500, detail="Không thể load model Whisper")
+        model = WhisperModel("base", device="cpu", compute_type="int8")
     return model
 
 @app.get("/")
@@ -52,49 +44,24 @@ async def transcribe_audio(
     language: str = Query("vi", description="Mã ngôn ngữ (vi, en, etc)"),
     format: str = Query("json", description="Output format: json, text, srt")
 ):
-    """
-    Transcribe audio file
-    - Hỗ trợ: mp3, wav, m4a, ogg, flac
-    - Max file size: 50MB (Vercel limit)
-    """
-    # Kiểm tra extension
-    allowed_extensions = ('.mp3', '.wav', '.m4a', '.ogg', '.flac')
-    if not file.filename.lower().endswith(allowed_extensions):
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Chỉ hỗ trợ file: {', '.join(allowed_extensions)}"
-        )
+    if not file.filename.endswith(('.mp3', '.wav', '.m4a', '.ogg', '.flac')):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file audio: mp3, wav, m4a, ogg, flac")
     
-    # Tạo temp file
-    temp_path = None
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f"whisper_{file.filename}")
+    
     try:
-        # Đọc file content
-        content = await file.read()
-        
-        # Kiểm tra size (50MB limit)
-        if len(content) > 50 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File quá lớn. Giới hạn 50MB")
-        
-        # Tạo temp file
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"whisper_{os.getpid()}_{file.filename}")
-        
         with open(temp_path, "wb") as f:
+            content = await file.read()
             f.write(content)
         
-        # Load model
         whisper_model = get_model()
-        
-        # Transcribe
         segments, info = whisper_model.transcribe(
             temp_path,
-            language=language if language else None,
-            beam_size=3,  # Giảm để nhanh hơn
-            vad_filter=True,  # Lọc silence
-            vad_parameters=dict(min_silence_duration_ms=500)
+            language=language,
+            beam_size=5
         )
         
-        # Collect results
         results = []
         full_text = []
         
@@ -106,7 +73,8 @@ async def transcribe_audio(
             })
             full_text.append(segment.text.strip())
         
-        # Format response
+        os.remove(temp_path)
+        
         if format == "text":
             return PlainTextResponse(" ".join(full_text))
         
@@ -118,7 +86,7 @@ async def transcribe_audio(
                 srt_content.append(f"{i}\n{start_time} --> {end_time}\n{seg['text']}\n")
             return PlainTextResponse("\n".join(srt_content))
         
-        else:  # json
+        else:
             return JSONResponse({
                 "success": True,
                 "language": info.language,
@@ -127,21 +95,12 @@ async def transcribe_audio(
                 "full_text": " ".join(full_text)
             })
     
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
-    
-    finally:
-        # Cleanup temp file
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except:
-                pass
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(status_code=500, detail=str(e))
 
 def format_timestamp(seconds):
-    """Convert seconds to SRT timestamp format"""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
@@ -150,11 +109,4 @@ def format_timestamp(seconds):
 
 @app.get("/health")
 def health():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "model_loaded": model is not None
-    }
-
-# Mangum handler cho Vercel
-handler = Mangum(app)
+    return {"status": "healthy"}
