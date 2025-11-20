@@ -1,8 +1,13 @@
 {
+  "version": 2,
   "functions": {
-    "index.py": {
-      "memory": 1024,
-      "maxDuration": 60
+    "api/index.py": {
+      "runtime": "python3.11",
+      "maxDuration": 300,
+      "memory": 1024
     }
-  }
+  },
+  "routes": [
+    { "src": "/(.*)", "dest": "/api/index.py" }
+  ]
 }
